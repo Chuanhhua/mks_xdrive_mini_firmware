@@ -41,9 +41,9 @@
 #define M0_IC PC1
 
 // // SPI pinout
-// #define SPI3_SCL  PC10
-// #define SPI3_MISO PC11
-// #define SPI3_MOSI PC12
+#define SPI3_SCL  PC10
+#define SPI3_MISO PC11
+#define SPI3_MOSI PC12
 #define AS5047_CS PA15
 // #define M0_nCS    PC13
 
@@ -191,6 +191,7 @@
 #include <SimpleFOC.h>
 // MagneticSensorSPI sensor = MagneticSensorSPI(AS5147_SPI, 10);
 MagneticSensorSPI sensor = MagneticSensorSPI(AS5047_SPI, AS5047_CS);
+SPIClass SPI_3(SPI3_MOSI, SPI3_MISO, SPI3_SCL);
 // BLDCDriver6PWM driver = BLDCDriver6PWM(5, 6, 9, 10, 3, 11, 8);
 BLDCDriver6PWM driver = BLDCDriver6PWM(M0_INH_A,M0_INL_A, M0_INH_B,M0_INL_B, M0_INH_C,M0_INL_C, EN_GATE);
 
@@ -199,7 +200,7 @@ void as5047_test_setup(){
   Serial.begin(115200);
 
   // initialise magnetic sensor hardware
-  sensor.init();
+  sensor.init(&SPI_3);
 
   Serial.println("Sensor ready");
   _delay(1000);
