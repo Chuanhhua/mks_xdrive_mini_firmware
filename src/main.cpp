@@ -194,7 +194,7 @@ MagneticSensorSPI sensor = MagneticSensorSPI(AS5047_SPI, AS5047_CS);
 // BLDCDriver6PWM driver = BLDCDriver6PWM(5, 6, 9, 10, 3, 11, 8);
 BLDCDriver6PWM driver = BLDCDriver6PWM(M0_INH_A,M0_INL_A, M0_INH_B,M0_INL_B, M0_INH_C,M0_INL_C, EN_GATE);
 
-void `as5047_test_setup(){
+void as5047_test_setup(){
   // monitoring port
   Serial.begin(115200);
 
