@@ -1,317 +1,240 @@
 /*
-  This code is an example of the full initialization of the MKS XDrive Mini board with 
-  the SimpleFOC library, including the setup of a Serial commander and a CAN commander 
-  for controlling the motor. The code initializes the motor, driver, sensor, and current 
-  sensing hardware, and sets up a timer to run the FOC algorithm in real-time.
+ * MKS XDrive Mini — FOC Torque Control
+ *
+ * Control:
+ *   CAN — write a 4-byte float [Nm] to register REG_CUSTOM_START (0xE0)
+ *          read  the same register to get the current torque setpoint
+ *
+ * Torque path:
+ *   target_torque_nm  (set by CAN)
+ *       → ramped_torque_nm  (rate-limited at TORQUE_RAMP_NM_S)
+ *           → Iq setpoint [A]  (= ramped_nm / (GEAR_RATIO * GEAR_EFF * KT))
+ *               → foc_current PI  (runs at 20 kHz in hardware timer ISR)
+ */
 
+#include <SimpleFOC.h>
+#include "SimpleFOCDrivers.h"
+#include "comms/can/CANCommander.h"
+#include "SimpleCANio.h"
 
-  CAN commander does not use CPU if not used, so it can be included in the project 
-  without any overhead if CAN communication is not needed.
+// =============================================================================
+// Pin Definitions
+// =============================================================================
 
-  The Serial commander allows to send commands to the motor and read monitoring 
-  data through the serial port and is configured to work directly with
-  webcontroller.simplefoc.com for easy monitoring and control of the motor.
-
-//   The FOC loop is run in a hardware timer interrupt for better real-time performance, 
-//   loopFOC is run at 20khz while the motion control loop is run every 5 FOC loops
-//   (4kHz) - this can be adjusted based on the use case. 
-// */
-
-
-// #include <Arduino.h>
-// #include <SimpleFOC.h>
-// #include "current_sense/hardware_specific/stm32/stm32_adc_utils.h"
-
-// #include "SimpleFOCDrivers.h"
-// // #include "comms/can/CANCommander.h"
-// // #include "SimpleCANio.h"
-
-
-// XDRIVE M0 motor pinout
+// 6-PWM gate driver (high-side / low-side pairs per phase)
 #define M0_INH_A PA8
 #define M0_INH_B PA9
 #define M0_INH_C PA10
 #define M0_INL_A PB13
 #define M0_INL_B PB14
 #define M0_INL_C PB15
-// M0 enable pin
-#define EN_GATE PB12
-// M0 currents
-#define M0_IB PC0
-#define M0_IC PC1
+#define EN_GATE  PB12
 
-// // SPI pinout
+// AS5047 magnetic encoder — SPI3
 #define SPI3_SCL  PC10
 #define SPI3_MISO PC11
 #define SPI3_MOSI PC12
 #define AS5047_CS PA15
-// #define M0_nCS    PC13
 
-// // voltage sensing pin and scale factor
-// #define VSENS    PA6
-// #define VSCALE   19.0f // voltage divider scale factor for voltage sensing
+// Low-side current sensing (phases B and C; phase A not connected)
+#define M0_IB PC0
+#define M0_IC PC1
 
-// // can communication pintout
-// // #define CAN0_RX PB_8
-// // #define CAN0_TX PB_9
+// Supply voltage divider
+#define VSENS  PA6
+#define VSCALE 19.0f   // ADC → actual voltage scale factor
 
-// // Motor instance
-// BLDCMotor motor = BLDCMotor(14);
-// BLDCDriver6PWM driver = BLDCDriver6PWM(M0_INH_A,M0_INL_A, M0_INH_B,M0_INL_B, M0_INH_C,M0_INL_C, EN_GATE);
+// CAN bus
+#define CAN0_RX     PB8
+#define CAN0_TX     PB9
+#define CAN_NODE_ID 1  // change if multiple nodes share the bus
 
-// MagneticSensorPWM sensor = MagneticSensorPWM(PA3, 56, 2170);
-// void doPWM(){sensor.handlePWM();}
+// =============================================================================
+// Motor / Gearbox Parameters
+// =============================================================================
 
-// // low side current sensing define
-// // 0.0005 Ohm resistor
-// // gain of 10x, 20x, 40x, 80x possible -
-// // we will use 80x for better low current sensing resolution (+-40A range)
-// // current sensing on B and C phases, phase A not connected
-// LowsideCurrentSense current_sense = LowsideCurrentSense(0.0005f, 80.0f, _NC, M0_IB, M0_IC);
+#define KT         0.23f   // motor torque constant [Nm/A]
+#define GEAR_RATIO 15.0f   // gearbox reduction ratio
+#define GEAR_EFF   0.6f    // gearbox efficiency
 
-// // initialising the sensor
-// // MagneticSensorSPI sensor = MagneticSensorSPI(AS5047_SPI, AS5047_CS, 10000000);
-// // SPI instance for sensor and driver configuration
-// SPIClass SPI_3(SPI3_MOSI, SPI3_MISO, SPI3_SCL);
+// =============================================================================
+// System Limits
+// =============================================================================
 
-// // instantiate the serial commander
-// Commander command = Commander(Serial);
-// void doMotor(char* cmd) { command.motor(&motor, cmd); }
+#define I_MAX          7.0f                                  // peak phase current [A]
+#define TORQUE_OUT_MAX (KT * I_MAX * GEAR_RATIO * GEAR_EFF) // max output torque [Nm]
 
-// // instantiate the CAN commander (does not use CPU if not used)
-// // CANio can(CAN0_RX, CAN0_TX); // Create CAN object
-// // CANCommander commandc(can, 15);//, false, 1000000, true);
+// =============================================================================
+// Current Controller Tuning
+// =============================================================================
+// Raise P for faster current response; raise I to eliminate steady-state error.
+// Raise LPF_TF for smoother but slower current feedback filtering.
+// PI_OUT_RAMP limits how fast the PI output voltage can change [V/s].
 
+#define PI_Q_P       0.3f    // q-axis (torque) proportional gain
+#define PI_Q_I       10.0f   // q-axis integral gain
+#define PI_D_P       0.3f    // d-axis (flux) proportional gain
+#define PI_D_I       10.0f   // d-axis integral gain
+#define LPF_TF       0.1f    // current low-pass filter time constant [s]
+#define PI_OUT_RAMP  100.0f  // PI output ramp rate [V/s]
 
-// void setup(){
-//   _delay(6000);
-//   // use monitoring with serial 
-//   Serial.begin(115200);
-//   // enable more verbose output for debugging
-//   // comment out if not needed
-//   SimpleFOCDebug::enable(&Serial);
+// Torque setpoint ramp rate — prevents step changes from feeling harsh [Nm/s]
+#define TORQUE_RAMP_NM_S 3.0f
 
-//   pinMode(VSENS, INPUT_ANALOG);
-//   float v = _readRegularADCVoltage(VSENS)*VSCALE;
-//   SIMPLEFOC_DEBUG(" V sens: ", v);
+// =============================================================================
+// Hardware Objects
+// =============================================================================
 
-//   // configure the gain of the drv8301 to 80 for better low current sensing resolution
-//   SPI_3.begin();
-//   SPI_3.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
-//   digitalWrite(M0_nCS, LOW);
-//   SPI_3.transfer(0x03); // address of the control register 3
-//   SPI_3.transfer(0b00000011); // set gain to 80
-//   digitalWrite(M0_nCS, HIGH); 
-//   SPI_3.endTransaction();
+MagneticSensorSPI   sensor        = MagneticSensorSPI(AS5047_SPI, AS5047_CS);
+SPIClass            SPI_3(SPI3_MOSI, SPI3_MISO, SPI3_SCL);
+BLDCDriver6PWM      driver        = BLDCDriver6PWM(M0_INH_A, M0_INL_A,
+                                                    M0_INH_B, M0_INL_B,
+                                                    M0_INH_C, M0_INL_C, EN_GATE);
+BLDCMotor           motor         = BLDCMotor(14); // 14 pole pairs
+LowsideCurrentSense current_sense = LowsideCurrentSense(
+    0.0005f,  // shunt resistance [Ω] — 0.5 mΩ
+    80.0f,    // amplifier gain
+    _NC, M0_IB, M0_IC);
 
-//   // power supply voltage [V]
-//   driver.voltage_power_supply = v;
-//   // Max DC voltage allowed - default voltage_power_supply
-//   driver.voltage_limit = v;
-//   driver.dead_zone = 0.001f;
-//   // driver init
-//   driver.init();
-//   // link the motor and the driver
-//   motor.linkDriver(&driver);
+// =============================================================================
+// Communication Objects
+// =============================================================================
 
-//   // initialize encoder sensor hardware
-//   // sensor.init(&SPI_3);
-//   sensor.init();
-//   // link the motor to the sensor
-//   motor.linkSensor(&sensor);
-  
-//   // control loop type and torque mode 
-//   motor.torque_controller = TorqueControlType::foc_current;
-//   motor.controller = MotionControlType::torque;
+CANio        can(CAN0_RX, CAN0_TX);
+CANCommander commandc(can, CAN_NODE_ID);
 
-//   // max voltage  allowed for motion control 
-//   motor.voltage_limit = 1.0;
-//   // alignment voltage limit
-//   motor.voltage_sensor_align = 1.5;
-  
-//   // comment out if not needed
-//   motor.useMonitoring(Serial);
-//   // setup monitoring for webcontroller.simplefoc.com
-//   motor.monitor_end_char = 'M'; // set monitoring end character to M 
-//   motor.monitor_start_char = 'M'; // set monitoring start character 
-//   // add target command T
-//   command.add('M', doMotor, "motor M0");
-//   motor.monitor_downsample = 0; // disable at start
+// =============================================================================
+// Shared State (written by CAN, read by FOC ISR)
+// =============================================================================
 
-//   // instantiate the CAN commander
-//   // commandc.init();
-//   // commandc.addMotor(&motor);
+volatile float target_torque_nm = 10.0f; // desired output torque [Nm] — 0 on boot
+volatile float ramped_torque_nm = 0.0f; // rate-limited copy fed to the current controller
 
-//   // initialise motor
-//   motor.init();
+// =============================================================================
+// Helper Functions
+// =============================================================================
 
-//   // link the driver
-//   current_sense.linkDriver(&driver);
-//   // init the current sense
-//   current_sense.init();  
-//   current_sense.skip_align = true;
-//   motor.linkCurrentSense(&current_sense);
+float readSupplyVoltage() {
+  return (analogRead(VSENS) / 4095.0f) * 3.3f * VSCALE;
+}
 
-//   // init FOC  
-//   motor.initFOC();  
+// =============================================================================
+// CAN Register Handlers — REG_CUSTOM_START (0xE0), 4-byte float [Nm]
+// =============================================================================
 
-//   //motor.characteriseMotor(1.0f); // characterise motor with 1.0V
-//   motor.tuneCurrentController(100.0f);
-//   delay(1000);
+bool canReadTorque(RegisterIO& comms, FOCMotor*) {
+  float nm = target_torque_nm;
+  comms << nm;
+  return true;
+}
 
-  
-//   motor.motion_downsample = 5; // run motion control every 10 loops (depends on the use case)
-//   // create a hardware timer
-//   // For example, we will create a timer that runs at 10kHz on the TIM5
-//   HardwareTimer* timer = new HardwareTimer(TIM8);
-//   // Set timer frequency to 50kHz
-//   timer->setOverflow(20000, HERTZ_FORMAT); 
-//   // add the loopFOC and move to the timer
-//   timer->attachInterrupt([](){
-//     // call the loopFOC and move functions
-//     motor.loopFOC();
-//     motor.move();
-//   });
-//   // start the timer
-//   timer->resume();
-// }
+bool canWriteTorque(RegisterIO& comms, FOCMotor*) {
+  float nm = 0.0f;
+  comms >> nm;
+  if (nm > TORQUE_OUT_MAX) nm = TORQUE_OUT_MAX;
+  target_torque_nm = nm;
+  return true;
+}
 
+// =============================================================================
+// Setup
+// =============================================================================
 
-// void loop(){
-//   // monitoring 
-//   motor.monitor();
-//   // user communication
-//   command.run();
-//   // CAN communication
-//   // commandc.run();
-// }
-
-
-
-#include <SimpleFOC.h>
-// MagneticSensorSPI sensor = MagneticSensorSPI(AS5147_SPI, 10);
-MagneticSensorSPI sensor = MagneticSensorSPI(AS5047_SPI, AS5047_CS);
-SPIClass SPI_3(SPI3_MOSI, SPI3_MISO, SPI3_SCL);
-// BLDCDriver6PWM driver = BLDCDriver6PWM(5, 6, 9, 10, 3, 11, 8);
-BLDCDriver6PWM driver = BLDCDriver6PWM(M0_INH_A,M0_INL_A, M0_INH_B,M0_INL_B, M0_INH_C,M0_INL_C, EN_GATE);
-
-void as5047_test_setup(){
-  // monitoring port
+void setup() {
   Serial.begin(115200);
+  SimpleFOCDebug::enable(&Serial); // startup diagnostics only
 
-  // initialise magnetic sensor hardware
+  // --- Supply voltage ---
+  pinMode(VSENS, INPUT_ANALOG);
+  float v = readSupplyVoltage();
+  Serial.print("Supply voltage: "); Serial.print(v); Serial.println(" V");
+
+  // --- Encoder ---
+  SPI_3.begin();
   sensor.init(&SPI_3);
 
-  Serial.println("Sensor ready");
-  _delay(1000);
-}
-
-void as5047_test_loop(){
-  // iterative function updating the sensor internal variables
-  // it is usually called in motor.loopFOC()
-  // this function reads the sensor hardware and 
-  // has to be called before getAngle nad getVelocity
-  sensor.update();
-  // display the angle and the angular velocity to the terminal
-  Serial.print(sensor.getAngle());
-  Serial.print("\t");
-  Serial.println(sensor.getVelocity());
-  _delay(100);
-}
-
-void bldc_test_setup(){
-  // use monitoring with serial 
-  Serial.begin(115200);
-  // enable more verbose output for debugging
-  // comment out if not needed
-  SimpleFOCDebug::enable(&Serial);
-  
-  // pwm frequency to be used [Hz]
-  // for atmega328 fixed to 32kHz
-  // esp32/stm32/teensy configurable
-  driver.pwm_frequency = 50000;
-  // power supply voltage [V]
-  driver.voltage_power_supply = 12;
-  // Max DC voltage allowed - default voltage_power_supply
-  driver.voltage_limit = 12;
-  // daad_zone [0,1] - default 0.02f - 2%
-  driver.dead_zone = 0.05f;
-
-  // driver init
-  if (!driver.init()){
+  // --- Gate driver ---
+  driver.pwm_frequency        = 50000; // 50 kHz PWM
+  driver.voltage_power_supply = v;
+  driver.voltage_limit        = v;
+  driver.dead_zone            = 0.05f;
+  if (!driver.init()) {
     Serial.println("Driver init failed!");
     return;
   }
-
-  // enable driver
   driver.enable();
-  Serial.println("Driver ready!");
-  _delay(1000);
+
+  // --- Motor ---
+  motor.linkDriver(&driver);
+  motor.linkSensor(&sensor);
+
+  motor.torque_controller    = TorqueControlType::foc_current; // closed-loop current control
+  motor.controller           = MotionControlType::torque;
+  motor.current_limit        = I_MAX;
+  motor.voltage_limit        = v;
+  motor.voltage_sensor_align = 2.0f; // alignment voltage — low enough to avoid current spike, high enough for current sense to register
+
+  // Current PI gains and output filter
+  motor.PID_current_q.P           = PI_Q_P;
+  motor.PID_current_q.I           = PI_Q_I;
+  motor.PID_current_q.output_ramp = PI_OUT_RAMP;
+  motor.PID_current_d.P           = PI_D_P;
+  motor.PID_current_d.I           = PI_D_I;
+  motor.PID_current_d.output_ramp = PI_OUT_RAMP;
+  motor.LPF_current_q.Tf          = LPF_TF;
+  motor.LPF_current_d.Tf          = LPF_TF;
+
+  // --- CAN commander ---
+  commandc.init();
+  commandc.addMotor(&motor);
+  commandc.addCustomRegister(REG_CUSTOM_START, 4, canReadTorque, canWriteTorque);
+
+  motor.init();
+
+  // --- Current sensing ---
+  current_sense.linkDriver(&driver);
+  if (!current_sense.init()) {
+    Serial.println("Current sense init failed!");
+    return;
+  }
+  current_sense.skip_align = true; // hardware polarity is fixed on MKS XDrive Mini
+  motor.linkCurrentSense(&current_sense);
+
+  // --- FOC calibration ---
+  motor.initFOC();
+
+  // --- FOC loop at 20 kHz via hardware timer ---
+  HardwareTimer* foc_timer = new HardwareTimer(TIM8);
+  foc_timer->setOverflow(20000, HERTZ_FORMAT);
+  foc_timer->attachInterrupt([]() {
+    motor.loopFOC(); // runs current PI and updates PWM
+
+    // Rate-limit the torque setpoint to avoid sudden current steps
+    constexpr float step = TORQUE_RAMP_NM_S / 20000.0f; // Nm per tick
+    float diff = target_torque_nm - ramped_torque_nm;
+    if      (diff >  step) ramped_torque_nm += step;
+    else if (diff < -step) ramped_torque_nm -= step;
+    else                   ramped_torque_nm  = target_torque_nm;
+
+    // Convert output Nm → motor Iq [A] and pass to current controller
+    motor.move(ramped_torque_nm / (GEAR_RATIO * GEAR_EFF * KT));
+  });
+  foc_timer->resume();
+
+  Serial.println("Ready. Waiting for CAN torque commands on register 0xE0.");
 }
 
-void bldc_test_loop(){
-  // setting pwm
-  // phase A: 3V
-  // phase B: 6V
-  // phase C: 5V
-  driver.setPwm(3,6,5);
-}
-
-
-void setup() {
-  as5047_test_setup();
-}
+// =============================================================================
+// Loop
+// =============================================================================
 
 void loop() {
-  as5047_test_loop();
+  // Refresh supply voltage reading once per second so the driver stays accurate
+  static unsigned long last_vsens = 0;
+  if (millis() - last_vsens > 1000) {
+    last_vsens = millis();
+    driver.voltage_power_supply = readSupplyVoltage();
+  }
+
+  commandc.run(); // process incoming CAN messages
 }
-
-
-
-
-
-
-// // BLDC driver standalone example
-// #include <SimpleFOC.h>
-
-// // BLDC driver instance
-// BLDCDriver6PWM driver = BLDCDriver6PWM(5, 6, 9,10, 3, 11, 8);
-
-// void setup() {
-
-//   // use monitoring with serial 
-//   Serial.begin(115200);
-//   // enable more verbose output for debugging
-//   // comment out if not needed
-//   SimpleFOCDebug::enable(&Serial);
-  
-//   // pwm frequency to be used [Hz]
-//   // for atmega328 fixed to 32kHz
-//   // esp32/stm32/teensy configurable
-//   driver.pwm_frequency = 50000;
-//   // power supply voltage [V]
-//   driver.voltage_power_supply = 12;
-//   // Max DC voltage allowed - default voltage_power_supply
-//   driver.voltage_limit = 12;
-//   // daad_zone [0,1] - default 0.02f - 2%
-//   driver.dead_zone = 0.05f;
-
-//   // driver init
-//   if (!driver.init()){
-//     Serial.println("Driver init failed!");
-//     return;
-//   }
-
-//   // enable driver
-//   driver.enable();
-//   Serial.println("Driver ready!");
-//   _delay(1000);
-// }
-
-// void loop() {
-//     // setting pwm
-//     // phase A: 3V
-//     // phase B: 6V
-//     // phase C: 5V
-//     driver.setPwm(3,6,5);
-// }
