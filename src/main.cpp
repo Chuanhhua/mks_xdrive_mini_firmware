@@ -107,7 +107,7 @@ CANCommander commandc(can, CAN_NODE_ID);
 // Shared State (written by CAN, read by FOC ISR)
 // =============================================================================
 
-volatile float target_torque_nm = 10.0f; // desired output torque [Nm] — 0 on boot
+volatile float target_torque_nm = 0.0f; // desired output torque [Nm] — 0 on boot
 volatile float ramped_torque_nm = 0.0f; // rate-limited copy fed to the current controller
 
 // =============================================================================
@@ -131,7 +131,8 @@ bool canReadTorque(RegisterIO& comms, FOCMotor*) {
 bool canWriteTorque(RegisterIO& comms, FOCMotor*) {
   float nm = 0.0f;
   comms >> nm;
-  if (nm > TORQUE_OUT_MAX) nm = TORQUE_OUT_MAX;
+  if      (nm >  TORQUE_OUT_MAX) nm =  TORQUE_OUT_MAX;
+  else if (nm < -TORQUE_OUT_MAX) nm = -TORQUE_OUT_MAX;
   target_torque_nm = nm;
   return true;
 }
