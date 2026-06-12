@@ -107,7 +107,7 @@ CANCommander commandc(can, CAN_NODE_ID);
 // Shared State (written by CAN, read by FOC ISR)
 // =============================================================================
 
-volatile float target_torque_nm = 0.0f; // desired output torque [Nm] — 0 on boot
+volatile float target_torque_nm = 3.0f; // desired output torque [Nm] — 0 on boot
 volatile float ramped_torque_nm = 0.0f; // rate-limited copy fed to the current controller
 
 // =============================================================================
