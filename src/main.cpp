@@ -38,7 +38,7 @@
 #define M0_IB PC0
 #define M0_IC PC1
 
-// SPI pinout
+// SPI pinout for onboard encoder (AS5047)
 #define SPI3_SCL  PC10
 #define SPI3_MISO PC11
 #define SPI3_MOSI PC12
@@ -49,12 +49,14 @@
 #define VSENS    PA6
 #define VSCALE   19.0f // voltage divider scale factor for voltage sensing
 
-// can communication pintout
-#define CAN0_RX PB_8
-#define CAN0_TX PB_9
+// // can communication pinout
+// #define CAN0_RX PB_8
+// #define CAN0_TX PB_9
+
+#define NO_POLE_PAIRS 14
 
 // Motor instance
-BLDCMotor motor = BLDCMotor(SET_POLE_PAIRS);
+BLDCMotor motor = BLDCMotor(NO_POLE_PAIRS);
 BLDCDriver6PWM driver = BLDCDriver6PWM(M0_INH_A,M0_INL_A, M0_INH_B,M0_INL_B, M0_INH_C,M0_INL_C, EN_GATE);
 
 
@@ -75,8 +77,8 @@ Commander command = Commander(Serial);
 void doMotor(char* cmd) { command.motor(&motor, cmd); }
 
 // instantiate the CAN commander (does not use CPU if not used)
-CANio can(CAN0_RX, CAN0_TX); // Create CAN object
-CANCommander commandc(can, 15);//, false, 1000000, true);
+// CANio can(CAN0_RX, CAN0_TX); // Create CAN object
+// CANCommander commandc(can, 15);//, false, 1000000, true);
 
 
 void setup(){
@@ -91,7 +93,7 @@ void setup(){
   float v = _readRegularADCVoltage(VSENS)*VSCALE;
   SIMPLEFOC_DEBUG(" V sens: ", v);
 
-  // configure the gain of the drv8301 to 80 for better low current sensing resolution
+  // configure the gain of the drv8301 (gate driver IC for three-phase motor drive) to 80 for better low current sensing resolution
   SPI_3.begin();
   SPI_3.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
   digitalWrite(M0_nCS, LOW);
@@ -117,11 +119,11 @@ void setup(){
   
   // control loop type and torque mode 
   motor.torque_controller = TorqueControlType::foc_current;
-  motor.controller = MotionControlType::torque;
+  motor.controller = MotionControlType::angle;
 
   // max voltage  allowed for motion control 
-  motor.voltage_limit = 1.0;
-  // alignment voltage limit
+  motor.voltage_limit = 31.0;
+  // alignment voltage limit (voltage limit during motor and sensor alignment - which is at the very start)
   motor.voltage_sensor_align = 1.5;
   
   // comment out if not needed
@@ -134,8 +136,16 @@ void setup(){
   motor.monitor_downsample = 0; // disable at start
 
   // instantiate the CAN commander
-  commandc.init();
-  commandc.addMotor(&motor);
+  // commandc.init();
+  // commandc.addMotor(&motor);
+
+  motor.PID_velocity.P = 0.1f;
+  motor.PID_velocity.I = 2.0f;
+  motor.PID_velocity.D = 0.0f;
+  motor.PID_velocity.output_ramp = 1000;
+
+  motor.P_angle.P = 5.0f;   // start small and increase slowly
+
 
   // initialise motor
   motor.init();
@@ -150,7 +160,7 @@ void setup(){
   // init FOC  
   motor.initFOC();  
 
-  //motor.characteriseMotor(1.0f); // characterise motor with 1.0V
+  motor.characteriseMotor(1.0f); // characterise motor with 1.0V
   motor.tuneCurrentController(100.0f);
   delay(1000);
 
@@ -178,5 +188,5 @@ void loop(){
   // user communication
   command.run();
   // CAN communication
-  commandc.run();
+  // commandc.run();
 }
