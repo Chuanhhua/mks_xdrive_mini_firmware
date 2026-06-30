@@ -54,7 +54,7 @@
 #define CAN0_TX PB_9
 
 // Motor instance
-BLDCMotor motor = BLDCMotor(SET_POLE_PAIRS);
+BLDCMotor motor = BLDCMotor(14);
 BLDCDriver6PWM driver = BLDCDriver6PWM(M0_INH_A,M0_INL_A, M0_INH_B,M0_INL_B, M0_INH_C,M0_INL_C, EN_GATE);
 
 
@@ -120,9 +120,9 @@ void setup(){
   motor.controller = MotionControlType::torque;
 
   // max voltage  allowed for motion control 
-  motor.voltage_limit = 1.0;
+  motor.voltage_limit = 30.0;
   // alignment voltage limit
-  motor.voltage_sensor_align = 1.5;
+  motor.voltage_sensor_align = 5.0;
   
   // comment out if not needed
   motor.useMonitoring(Serial);
@@ -150,7 +150,7 @@ void setup(){
   // init FOC  
   motor.initFOC();  
 
-  //motor.characteriseMotor(1.0f); // characterise motor with 1.0V
+  motor.characteriseMotor(1.0f); // characterise motor with 1.0V
   motor.tuneCurrentController(100.0f);
   delay(1000);
 
@@ -180,3 +180,87 @@ void loop(){
   // CAN communication
   commandc.run();
 }
+
+
+
+
+// /*
+// This code example shows normal operation of the SimpleCANio library.
+
+// It will work with any stm32 and esp32 board that support CAN/CAN FD
+// */
+// #include <Arduino.h>
+// #include "SimpleCANio.h"   // <- this is the only include required, it should be smart enough to find the correct subclass
+
+// #define CAN_ID 0x321
+
+// // #define CAN0_RX PB_8
+// // #define CAN0_TX PB_9
+
+// #define CAN_RX  PB_8// TODO set your CAN RX and TX pins here
+// #define CAN_TX  PB_9// TODO set your CAN RX and TX pins here
+// #define CAN_SHDN NC
+// #define CAN_ENABLE NC
+
+// CANio can = CANio(CAN_RX, CAN_TX, CAN_SHDN, CAN_ENABLE); // <- create SimpleCAN object
+
+// void setup()
+// {
+
+//     Serial.begin(230400);
+
+//     can.logTo(&Serial);
+//     delay(2000);
+//     Serial.println("Starting CAN");
+//     // can.enableInternalLoopback();
+    
+//     // choose one of the receive filters to apply
+//     CanFilter filter = CanFilter(MASK_EXTENDED, CAN_ID, CAN_ID, FILTER_ANY_FRAME);
+//     // CanFilter filter = CanFilter(MASK_STANDARD, CAN_ID, CAN_ID, FILTER_ANY_FRAME);
+//     // CanFilter filter = CanFilter(MASK_ACCEPT_ALL);
+//     can.filter(filter);
+
+//     // 1 mbps
+//     can.begin(1000000);
+//     delay(10);
+// }
+
+// uint8_t data[8] = {0};
+// uint8_t num = 0;
+
+// void loop()
+// {
+
+//     data[0] = num++;
+
+//     bool isExtendedFrame = false;
+//     bool isRtr = false;
+//     delay(50);
+//     CanMsg txMsg = CanMsg(
+//         isExtendedFrame ? CanExtendedId(CAN_ID, isRtr) : CanStandardId(CAN_ID, isRtr),
+//         4,
+//         data);
+//     delay(50);
+
+//     can.write(txMsg);
+//     delay(1);
+
+//     if (can.available() > 0)
+//     {
+//         CanMsg const rxMsg = can.read();
+
+//         Serial.print("polling read: ");
+//         if (rxMsg.isExtendedId())
+//         {
+//             Serial.print(rxMsg.getExtendedId(), HEX);
+//             Serial.println(" Extended ✅");
+//         }
+//         else
+//         {
+//             Serial.print(rxMsg.getStandardId(), HEX);
+//             Serial.println(" Standard ✅");
+//         }
+//     }
+
+//     delay(2000);
+// }
