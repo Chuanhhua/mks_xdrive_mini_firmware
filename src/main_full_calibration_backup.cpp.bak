@@ -51,22 +51,6 @@
 // timer interrupt, so no CAN/Serial command can exceed it (7 A ≈ 27.5 Nm at the joint)
 #define CURRENT_CLAMP_A 7.0f
 
-// Motor calibration mode.
-//   1 = full auto-calibration on boot (slow, ~several seconds). Runs characteriseMotor,
-//       tuneCurrentController and a full initFOC alignment, then PRINTS the results.
-//   0 = fast boot (<1 s). Skips all measurement and uses the hardcoded values below.
-// Procedure: build once with 1, copy the printed values into the CAL_* defines,
-// then set this to 0 for every normal boot.
-#define MOTOR_CALIBRATE 0
-
-// --- Values captured from a MOTOR_CALIBRATE==1 boot (fill these in) ---
-#define CAL_ZERO_ELECTRIC_ANGLE 0.2393f          // motor.zero_electric_angle
-#define CAL_SENSOR_DIRECTION    Direction::CCW    // motor.sensor_direction (CW or CCW)
-#define CAL_PHASE_RESISTANCE    2.5887f           // motor.phase_resistance [Ohm]
-#define CAL_PHASE_INDUCTANCE    0.001117f         // motor.phase_inductance [H]
-#define CAL_CURRENT_PID_P       0.8841f           // motor.PID_current_q/d.P
-#define CAL_CURRENT_PID_I       1626.5239f        // motor.PID_current_q/d.I
-
 // Motor instance
 BLDCMotor motor = BLDCMotor(14);
 BLDCDriver6PWM driver = BLDCDriver6PWM(M0_INH_A,M0_INL_A, M0_INH_B,M0_INL_B, M0_INH_C,M0_INL_C, EN_GATE);
@@ -88,9 +72,9 @@ SPIClass SPI_3(SPI3_MOSI, SPI3_MISO, SPI3_SCL);
 Commander command = Commander(Serial);
 void doMotor(char* cmd) { command.motor(&motor, cmd); }
 
-// CAN commander — node address 15(left)/16(right)
+// CAN commander — node address 16
 CANio can(CAN0_RX, CAN0_TX);
-CANCommander commandc(can, 15);
+CANCommander commandc(can, 16);
 
 
 // DRV8301 SPI access — 16-bit frames: bit15 R/W (1=read), bits[14:11] register, bits[10:0] data.
@@ -199,37 +183,14 @@ void setup(){
   current_sense.skip_align = true;
   motor.linkCurrentSense(&current_sense);
 
-#if MOTOR_CALIBRATE
-  // --- Slow path: measure everything, then print it for hardcoding ---
-  motor.initFOC();                    // aligns encoder -> finds zero_electric_angle + direction
-  motor.characteriseMotor(1.0f);      // measures phase_resistance + phase_inductance at 1.0 V
-  motor.tuneCurrentController(100.0f);// computes current PID from measured R/L
+  // init FOC  
+  motor.initFOC();  
+
+  motor.characteriseMotor(1.0f); // characterise motor with 1.0V
+  motor.tuneCurrentController(100.0f);
   delay(1000);
 
-  Serial.println("==== COPY THESE INTO THE CAL_* DEFINES ====");
-  Serial.print("CAL_ZERO_ELECTRIC_ANGLE "); Serial.println(motor.zero_electric_angle, 4);
-  Serial.print("CAL_SENSOR_DIRECTION    "); Serial.println(motor.sensor_direction == Direction::CW ? "CW" : "CCW");
-  Serial.print("CAL_PHASE_RESISTANCE    "); Serial.println(motor.phase_resistance, 4);
-  Serial.print("CAL_PHASE_INDUCTANCE    "); Serial.println(motor.phase_inductance, 6);
-  Serial.print("CAL_CURRENT_PID_P       "); Serial.println(motor.PID_current_q.P, 4);
-  Serial.print("CAL_CURRENT_PID_I       "); Serial.println(motor.PID_current_q.I, 4);
-  Serial.println("===========================================");
-#else
-  // --- Fast path: use the hardcoded calibration, skip all measurement ---
-  motor.phase_resistance   = CAL_PHASE_RESISTANCE;
-  motor.phase_inductance   = CAL_PHASE_INDUCTANCE;
-  motor.PID_current_q.P    = CAL_CURRENT_PID_P;
-  motor.PID_current_q.I    = CAL_CURRENT_PID_I;
-  motor.PID_current_d.P    = CAL_CURRENT_PID_P;
-  motor.PID_current_d.I    = CAL_CURRENT_PID_I;
-  // set the known offset + direction so initFOC skips both alignment steps
-  // ("Skip dir calib." + "Skip offset calib.")
-  motor.sensor_direction    = CAL_SENSOR_DIRECTION;
-  motor.zero_electric_angle = CAL_ZERO_ELECTRIC_ANGLE;
-  motor.initFOC();
-#endif
-
-
+  
   motor.motion_downsample = 5; // run motion control every 5 FOC loops (4 kHz)
   // run the FOC loop in a 20 kHz hardware timer interrupt
   HardwareTimer* timer = new HardwareTimer(TIM8);
